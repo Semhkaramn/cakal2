@@ -1,14 +1,17 @@
 """
 Heroku PostgreSQL Veritabanı Yönetimi - DÜZELTILMIŞ VERSIYON
-SQL hataları çözülmüş, optimized queries
+SQL hataları çözülmüş, connection management iyileştirilmiş
 """
 
 import psycopg2
 from psycopg2.extras import RealDictCursor
+from psycopg2.pool import SimpleConnectionPool
 import logging
 import os
 from datetime import datetime
-from typing import List, Tuple, Optional, Dict
+from typing import List, Tuple, Optional, Dict, Union
+from contextlib import contextmanager
+import threading
 
 logger = logging.getLogger(__name__)
 
@@ -16,6 +19,8 @@ class DatabaseManager:
     def __init__(self):
         """PostgreSQL ile bağlan ve tabloları oluştur"""
         self.db_url = os.getenv('DATABASE_URL')
+        self.connection_pool = None
+        self._lock = threading.Lock()
 
         if not self.db_url:
             logger.error("❌ DATABASE_URL bulunamadı!")
@@ -29,10 +34,15 @@ class DatabaseManager:
         logger.info("🗄️ PostgreSQL'e bağlanılıyor...")
 
         try:
+            # Connection pool oluştur
+            self._create_connection_pool()
+
             # Test connection
-            test_conn = self.get_connection()
-            test_conn.close()
-            logger.info("✅ PostgreSQL bağlantısı başarılı!")
+            with self.get_connection() as test_conn:
+                with test_conn.cursor() as cursor:
+                    cursor.execute("SELECT version();")
+                    version = cursor.fetchone()
+                    logger.info(f"✅ PostgreSQL bağlantısı başarılı: {version[0][:50]}...")
 
             # Tabloları oluştur
             self.init_database()
@@ -47,22 +57,43 @@ class DatabaseManager:
             logger.error(f"❌ PostgreSQL başlatma hatası: {type(e).__name__}: {str(e)}")
             raise
 
-    def get_connection(self):
-        """PostgreSQL bağlantısı al"""
+    def _create_connection_pool(self):
+        """Connection pool oluştur"""
         try:
-            conn = psycopg2.connect(
-                self.db_url,
-                cursor_factory=RealDictCursor,
-                connect_timeout=30,
-                sslmode='require'
+            self.connection_pool = SimpleConnectionPool(
+                minconn=1,
+                maxconn=10,
+                dsn=self.db_url,
+                cursor_factory=RealDictCursor
             )
-            return conn
-        except psycopg2.OperationalError as e:
-            logger.error(f"❌ PostgreSQL connection error: {e}")
+        except Exception as e:
+            logger.error(f"❌ Connection pool oluşturulamadı: {e}")
+            raise
+
+    @contextmanager
+    def get_connection(self):
+        """Connection pool'dan bağlantı al"""
+        connection = None
+        try:
+            with self._lock:
+                connection = self.connection_pool.getconn()
+
+            yield connection
+
+        except psycopg2.Error as e:
+            if connection:
+                connection.rollback()
+            logger.error(f"❌ Database işlem hatası: {e}")
             raise
         except Exception as e:
-            logger.error(f"❌ Database connection failed: {type(e).__name__}: {str(e)}")
+            if connection:
+                connection.rollback()
+            logger.error(f"❌ Genel database hatası: {e}")
             raise
+        finally:
+            if connection:
+                with self._lock:
+                    self.connection_pool.putconn(connection)
 
     def init_database(self):
         """PostgreSQL tablolarını oluştur"""
@@ -123,7 +154,7 @@ class DatabaseManager:
                     cursor.execute('''
                         CREATE TABLE IF NOT EXISTS sent_messages (
                             id SERIAL PRIMARY KEY,
-                            sender_account_id INTEGER,
+                            sender_account_id INTEGER DEFAULT 1,
                             target_user_id BIGINT UNIQUE NOT NULL,
                             message_text TEXT NOT NULL,
                             sent_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -146,11 +177,11 @@ class DatabaseManager:
                     ''')
 
                     # İndeksler
-                    cursor.execute('''
-                        CREATE INDEX IF NOT EXISTS idx_active_members_user_id ON active_members(user_id);
-                        CREATE INDEX IF NOT EXISTS idx_sent_messages_target_user ON sent_messages(target_user_id);
-                        CREATE INDEX IF NOT EXISTS idx_sent_messages_sent_at ON sent_messages(sent_at);
-                    ''')
+                    cursor.execute('CREATE INDEX IF NOT EXISTS idx_active_members_user_id ON active_members(user_id);')
+                    cursor.execute('CREATE INDEX IF NOT EXISTS idx_active_members_group_id ON active_members(group_id);')
+                    cursor.execute('CREATE INDEX IF NOT EXISTS idx_sent_messages_target_user ON sent_messages(target_user_id);')
+                    cursor.execute('CREATE INDEX IF NOT EXISTS idx_sent_messages_sent_at ON sent_messages(sent_at);')
+                    cursor.execute('CREATE INDEX IF NOT EXISTS idx_group_members_user_group ON group_members(user_id, group_id);')
 
                     conn.commit()
                     logger.info("✅ PostgreSQL tabloları oluşturuldu")
@@ -172,28 +203,27 @@ class DatabaseManager:
                         INSERT INTO accounts (phone_number, session_name)
                         VALUES (%s, %s)
                         ON CONFLICT (phone_number)
-                        DO UPDATE SET session_name = EXCLUDED.session_name
+                        DO UPDATE SET
+                            session_name = EXCLUDED.session_name,
+                            last_used = CURRENT_TIMESTAMP
                         RETURNING id
                     ''', (phone_number, session_name))
 
                     result = cursor.fetchone()
                     conn.commit()
                     return result['id'] if result else None
+
         except Exception as e:
             logger.error(f"Account ekleme hatası: {e}")
             return 1
 
-    def add_active_member(self, member_data: dict):
+    def add_active_member(self, member_data: Dict[str, Union[int, str, bool]]):
         """Aktif üye ekle - GEÇERLİLİK KONTROLÜ İLE"""
         try:
             # Güvenlik kontrolü
             user_id = member_data.get('user_id')
-            if not user_id or not isinstance(user_id, int) or user_id <= 0:
+            if not self._is_valid_user_id(user_id):
                 logger.debug(f"Geçersiz user_id: {user_id}")
-                return
-
-            if user_id >= 9999999999999999999:  # Çok büyük ID'ler
-                logger.debug(f"Çok büyük user_id: {user_id}")
                 return
 
             with self.get_connection() as conn:
@@ -224,24 +254,38 @@ class DatabaseManager:
                         member_data.get('is_active', True)
                     ))
                     conn.commit()
+
         except Exception as e:
             logger.debug(f"Aktif üye ekleme hatası: {e}")
 
-    def add_group_members(self, members_data: List[dict]):
+    def _is_valid_user_id(self, user_id: Union[int, str, None]) -> bool:
+        """User ID doğrulaması"""
+        try:
+            if user_id is None:
+                return False
+            user_id = int(user_id)
+            return 1 <= user_id <= 9999999999999999999
+        except (ValueError, TypeError):
+            return False
+
+    def add_group_members(self, members_data: List[Dict[str, Union[int, str, bool]]]):
         """Grup üyelerini toplu ekle"""
         if not members_data:
+            return
+
+        valid_members = [m for m in members_data if self._is_valid_user_id(m.get('user_id'))]
+
+        if not valid_members:
+            logger.debug("Geçerli grup üyesi bulunamadı")
             return
 
         try:
             with self.get_connection() as conn:
                 with conn.cursor() as cursor:
-                    for member in members_data:
-                        cursor.execute('''
-                            INSERT INTO group_members
-                            (user_id, username, first_name, last_name, phone, is_bot, is_admin, group_id, group_title)
-                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-                            ON CONFLICT (user_id, group_id) DO NOTHING
-                        ''', (
+                    # Batch insert için executemany kullan
+                    insert_data = []
+                    for member in valid_members:
+                        insert_data.append((
                             member['user_id'],
                             member.get('username'),
                             member.get('first_name'),
@@ -252,12 +296,21 @@ class DatabaseManager:
                             member['group_id'],
                             member.get('group_title')
                         ))
+
+                    cursor.executemany('''
+                        INSERT INTO group_members
+                        (user_id, username, first_name, last_name, phone, is_bot, is_admin, group_id, group_title)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        ON CONFLICT (user_id, group_id) DO NOTHING
+                    ''', insert_data)
+
                     conn.commit()
-                    logger.info(f"✅ {len(members_data)} grup üyesi eklendi")
+                    logger.info(f"✅ {len(valid_members)} grup üyesi eklendi")
+
         except Exception as e:
             logger.error(f"Grup üyeleri ekleme hatası: {e}")
 
-    def get_uncontacted_members(self, limit: int = None, source: str = "both") -> List[Tuple]:
+    def get_uncontacted_members(self, limit: Optional[int] = None, source: str = "both") -> List[Tuple]:
         """
         Henüz mesaj gönderilmemiş üyeleri getir - DÜZELTILMIŞ SQL
         """
@@ -294,9 +347,9 @@ class DatabaseManager:
                             ORDER BY gm.collected_at DESC
                         '''
                     else:
-                        # DÜZELTILMIŞ: Her iki kaynaktan da
+                        # Her iki kaynaktan da - UNION ile
                         query = '''
-                            SELECT user_id, username, first_name, last_name
+                            SELECT DISTINCT user_id, username, first_name, last_name
                             FROM (
                                 SELECT am.user_id, am.username, am.first_name, am.last_name, 1 as priority
                                 FROM active_members am
@@ -320,24 +373,33 @@ class DatabaseManager:
                                 AND gm.user_id IS NOT NULL
                                 AND gm.user_id > 0
                                 AND gm.user_id < 9999999999999999999
+                                AND NOT EXISTS (
+                                    SELECT 1 FROM active_members am2
+                                    WHERE am2.user_id = gm.user_id
+                                )
                             ) combined
                             ORDER BY priority ASC, user_id ASC
                         '''
 
-                    if limit:
-                        query += f' LIMIT {limit}'
+                    if limit and limit > 0:
+                        query += f' LIMIT {int(limit)}'
 
                     cursor.execute(query)
                     results = cursor.fetchall()
 
-                    # Ek güvenlik kontrolü
+                    # Ek güvenlik kontrolü ve tuple'a dönüştürme
                     filtered_results = []
                     for row in results:
                         user_id = row['user_id']
-                        if user_id and isinstance(user_id, int) and 0 < user_id < 9999999999999999999:
-                            filtered_results.append((user_id, row['username'], row['first_name'], row['last_name']))
+                        if self._is_valid_user_id(user_id):
+                            filtered_results.append((
+                                user_id,
+                                row.get('username'),
+                                row.get('first_name'),
+                                row.get('last_name')
+                            ))
 
-                    logger.info(f"📊 Güvenli filtre: {len(results)} -> {len(filtered_results)} geçerli hedef")
+                    logger.info(f"📊 Hedef bulundu: {len(results)} -> {len(filtered_results)} geçerli")
                     return filtered_results
 
         except Exception as e:
@@ -345,22 +407,32 @@ class DatabaseManager:
             return []
 
     def log_sent_message(self, sender_account_id: int, target_user_id: int,
-                        message_text: str, success: bool = True, error_message: str = None):
+                        message_text: str, success: bool = True, error_message: Optional[str] = None):
         """Gönderilen mesajı kaydet"""
         try:
+            if not self._is_valid_user_id(target_user_id):
+                return
+
             with self.get_connection() as conn:
                 with conn.cursor() as cursor:
                     cursor.execute('''
                         INSERT INTO sent_messages
                         (sender_account_id, target_user_id, message_text, success, error_message)
                         VALUES (%s, %s, %s, %s, %s)
-                        ON CONFLICT (target_user_id) DO NOTHING
+                        ON CONFLICT (target_user_id)
+                        DO UPDATE SET
+                            sender_account_id = EXCLUDED.sender_account_id,
+                            message_text = EXCLUDED.message_text,
+                            success = EXCLUDED.success,
+                            error_message = EXCLUDED.error_message,
+                            sent_at = CURRENT_TIMESTAMP
                     ''', (sender_account_id, target_user_id, message_text, success, error_message))
                     conn.commit()
+
         except Exception as e:
             logger.debug(f"Mesaj kaydetme hatası: {e}")
 
-    def get_statistics(self) -> dict:
+    def get_statistics(self) -> Dict[str, int]:
         """İstatistikleri getir - DÜZELTILMIŞ"""
         try:
             with self.get_connection() as conn:
@@ -373,12 +445,20 @@ class DatabaseManager:
                     stats['active_accounts'] = result['count'] if result else 0
 
                     # Toplam static üye sayısı
-                    cursor.execute('SELECT COUNT(*) as count FROM group_members WHERE is_bot = FALSE AND is_admin = FALSE')
+                    cursor.execute('''
+                        SELECT COUNT(*) as count
+                        FROM group_members
+                        WHERE is_bot = FALSE AND is_admin = FALSE
+                    ''')
                     result = cursor.fetchone()
                     stats['static_members'] = result['count'] if result else 0
 
                     # Toplam aktif üye sayısı
-                    cursor.execute('SELECT COUNT(*) as count FROM active_members WHERE is_bot = FALSE AND is_admin = FALSE AND is_active = TRUE')
+                    cursor.execute('''
+                        SELECT COUNT(*) as count
+                        FROM active_members
+                        WHERE is_bot = FALSE AND is_admin = FALSE AND is_active = TRUE
+                    ''')
                     result = cursor.fetchone()
                     stats['active_members'] = result['count'] if result else 0
 
@@ -401,18 +481,34 @@ class DatabaseManager:
                             LEFT JOIN sent_messages sm ON gm.user_id = sm.target_user_id
                             WHERE sm.target_user_id IS NULL
                             AND gm.is_bot = FALSE AND gm.is_admin = FALSE
+                            AND NOT EXISTS (
+                                SELECT 1 FROM active_members am2 WHERE am2.user_id = gm.user_id
+                            )
                         ) combined
                     ''')
                     result = cursor.fetchone()
                     stats['remaining_members'] = result['count'] if result else 0
 
                     # Toplam benzersiz üye
-                    stats['total_unique_members'] = stats['active_members'] + stats['static_members']
+                    cursor.execute('''
+                        SELECT COUNT(DISTINCT user_id) as count FROM (
+                            SELECT user_id FROM active_members
+                            WHERE is_bot = FALSE AND is_admin = FALSE
+                            UNION
+                            SELECT user_id FROM group_members
+                            WHERE is_bot = FALSE AND is_admin = FALSE
+                        ) combined
+                    ''')
+                    result = cursor.fetchone()
+                    stats['total_unique_members'] = result['count'] if result else 0
+
+                    # Ek alanlar
                     stats['total_members'] = stats['total_unique_members']
                     stats['remaining_active_members'] = 0
                     stats['remaining_static_members'] = 0
 
                     return stats
+
         except Exception as e:
             logger.error(f"İstatistik hatası: {e}")
             return {
@@ -421,29 +517,60 @@ class DatabaseManager:
                 'remaining_members': 0, 'remaining_active_members': 0, 'remaining_static_members': 0
             }
 
-    def get_session_stats(self) -> dict:
+    def get_session_stats(self) -> Dict[str, Union[int, float]]:
         """Günlük istatistikler - DÜZELTILMIŞ"""
         stats = self.get_statistics()
         try:
             with self.get_connection() as conn:
                 with conn.cursor() as cursor:
+                    # Bugün gönderilen mesajlar
                     cursor.execute('''
-                        SELECT COUNT(*) as count FROM sent_messages
+                        SELECT COUNT(*) as count
+                        FROM sent_messages
                         WHERE DATE(sent_at) = CURRENT_DATE AND success = TRUE
                     ''')
                     result = cursor.fetchone()
                     messages_today = result['count'] if result else 0
 
+                    # Bugün başarısız mesajlar
+                    cursor.execute('''
+                        SELECT COUNT(*) as count
+                        FROM sent_messages
+                        WHERE DATE(sent_at) = CURRENT_DATE AND success = FALSE
+                    ''')
+                    result = cursor.fetchone()
+                    failed_today = result['count'] if result else 0
+
+                    # Başarı oranı
+                    total_today = messages_today + failed_today
+                    success_rate = int((messages_today / total_today) * 100) if total_today > 0 else 100
+
+                    # Bugün toplanan üyeler
+                    cursor.execute('''
+                        SELECT COUNT(*) as count
+                        FROM active_members
+                        WHERE DATE(collected_at) = CURRENT_DATE
+                    ''')
+                    result = cursor.fetchone()
+                    new_members_today = result['count'] if result else 0
+
                     return {
                         **stats,
                         'messages_today': messages_today,
-                        'new_members_today': 0,
-                        'failed_today': 0,
-                        'success_rate_today': 100
+                        'failed_today': failed_today,
+                        'success_rate_today': success_rate,
+                        'new_members_today': new_members_today
                     }
+
         except Exception as e:
             logger.error(f"Session stats hatası: {e}")
-            return {**stats, 'messages_today': 0, 'new_members_today': 0, 'failed_today': 0, 'success_rate_today': 0}
+            return {
+                **stats,
+                'messages_today': 0,
+                'failed_today': 0,
+                'success_rate_today': 100,
+                'new_members_today': 0
+            }
 
     def reset_all_data(self):
         """Tüm verileri sıfırla"""
@@ -457,6 +584,7 @@ class DatabaseManager:
                     cursor.execute('UPDATE accounts SET message_count = 0, last_used = NULL')
                     conn.commit()
                     logger.info("✅ PostgreSQL veriler sıfırlandı")
+
         except Exception as e:
             logger.error(f"Veri sıfırlama hatası: {e}")
 
@@ -469,55 +597,74 @@ class DatabaseManager:
                     cursor.execute('UPDATE accounts SET message_count = 0')
                     conn.commit()
                     logger.info("✅ PostgreSQL mesaj kayıtları sıfırlandı")
+
         except Exception as e:
             logger.error(f"Mesaj sıfırlama hatası: {e}")
 
-    def get_heroku_database_info(self) -> dict:
+    def get_heroku_database_info(self) -> Dict[str, Union[str, Dict[str, int]]]:
         """PostgreSQL bilgilerini getir"""
         try:
             with self.get_connection() as conn:
                 with conn.cursor() as cursor:
                     info = {}
 
+                    # Database version
                     cursor.execute("SELECT version()")
                     result = cursor.fetchone()
                     info['version'] = result[0] if result else "Unknown"
 
+                    # Database size
                     cursor.execute("SELECT pg_size_pretty(pg_database_size(current_database()))")
                     result = cursor.fetchone()
                     info['database_size'] = result[0] if result else "Unknown"
 
-                    tables = ['accounts', 'active_members', 'group_members', 'sent_messages']
+                    # Table counts
+                    tables = ['accounts', 'active_members', 'group_members', 'sent_messages', 'failed_operations']
                     info['table_counts'] = {}
 
                     for table in tables:
-                        cursor.execute(f"SELECT COUNT(*) as count FROM {table}")
-                        result = cursor.fetchone()
-                        info['table_counts'][table] = result['count'] if result else 0
+                        try:
+                            cursor.execute(f"SELECT COUNT(*) as count FROM {table}")
+                            result = cursor.fetchone()
+                            info['table_counts'][table] = result['count'] if result else 0
+                        except Exception:
+                            info['table_counts'][table] = 0
 
                     return info
+
         except Exception as e:
             logger.error(f"Database info hatası: {e}")
             return {}
 
-    # Uyumluluk için
+    def close_connections(self):
+        """Tüm bağlantıları kapat"""
+        if self.connection_pool:
+            self.connection_pool.closeall()
+            logger.info("🔒 Database connections kapatıldı")
+
+    # Backward compatibility methods
     def clear_sent_messages(self):
+        """Geriye uyumluluk için"""
         self.reset_sent_messages_only()
 
     def clear_group_members(self):
+        """Grup üyelerini temizle"""
         try:
             with self.get_connection() as conn:
                 with conn.cursor() as cursor:
                     cursor.execute('DELETE FROM group_members')
                     conn.commit()
+                    logger.info("🗑️ Grup üyeleri temizlendi")
         except Exception as e:
             logger.error(f"Grup üyeleri silme hatası: {e}")
 
     def clear_active_members(self):
+        """Aktif üyeleri temizle"""
         try:
             with self.get_connection() as conn:
                 with conn.cursor() as cursor:
                     cursor.execute('DELETE FROM active_members')
                     conn.commit()
+                    logger.info("🗑️ Aktif üyeler temizlendi")
         except Exception as e:
             logger.error(f"Aktif üyeler silme hatası: {e}")
