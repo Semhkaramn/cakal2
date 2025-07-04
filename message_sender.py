@@ -7,15 +7,15 @@ import logging
 import asyncio
 import random
 from datetime import datetime, timedelta
-from typing import List, Tuple, Dict, Optional
+from typing import List, Tuple, Dict, Optional, Union
 from telethon import TelegramClient
 from telethon.errors import (
     FloodWaitError, PeerFloodError, UserPrivacyRestrictedError,
     UserNotParticipantError, ChatWriteForbiddenError, UserBannedInChannelError,
-    InputUserDeactivatedError, UserDeactivatedError
-    # EntityUseError kaldırıldı - Telethon'da mevcut değil
+    InputUserDeactivatedError, UserDeactivatedError, UserIsBlockedError,
+    ChatAdminRequiredError, ChannelPrivateError, RPCError
 )
-from telethon.tl.types import User
+from telethon.tl.types import User, InputPeerUser
 import config
 from database import DatabaseManager
 from account_manager import AccountManager
@@ -40,7 +40,7 @@ class MessageSender:
         """Command handler referansını ayarla"""
         self.command_handler = command_handler
 
-    async def send_messages_batch(self, targets: List[Tuple], batch_size: int = 20) -> Dict:
+    async def send_messages_batch(self, targets: List[Tuple], batch_size: int = 20) -> Dict[str, Union[int, List]]:
         """Hedef listesine batch halinde mesaj gönder - DÜZELTILMIŞ"""
         results = {
             'sent': 0,
@@ -56,13 +56,7 @@ class MessageSender:
         logger.info(f"📤 {len(targets)} hedefe mesaj gönderimi başlıyor...")
 
         # Hedefleri doğrula
-        valid_targets = []
-        for target in targets:
-            if len(target) >= 4 and target[0] and isinstance(target[0], int) and target[0] > 0:
-                valid_targets.append(target)
-            else:
-                logger.debug(f"Geçersiz hedef atlandı: {target}")
-                results['failed'] += 1
+        valid_targets = self._validate_targets(targets)
 
         if not valid_targets:
             logger.warning("❌ Geçerli hedef bulunamadı!")
@@ -98,7 +92,27 @@ class MessageSender:
         logger.info(f"✅ Batch gönderim tamamlandı: {results['sent']} başarılı, {results['failed']} başarısız")
         return results
 
-    async def _process_batch(self, batch: List[Tuple]) -> Dict:
+    def _validate_targets(self, targets: List[Tuple]) -> List[Tuple]:
+        """Hedefleri doğrula"""
+        valid_targets = []
+        for target in targets:
+            try:
+                if len(target) >= 4 and target[0] and isinstance(target[0], int) and target[0] > 0:
+                    # ID kontrolü
+                    user_id = target[0]
+                    if config.MIN_USER_ID <= user_id <= config.MAX_USER_ID:
+                        valid_targets.append(target)
+                    else:
+                        logger.debug(f"ID aralık dışı: {user_id}")
+                else:
+                    logger.debug(f"Geçersiz hedef formatı: {target}")
+            except (IndexError, TypeError, ValueError) as e:
+                logger.debug(f"Hedef parsing hatası: {e}")
+                continue
+
+        return valid_targets
+
+    async def _process_batch(self, batch: List[Tuple]) -> Dict[str, Union[int, List]]:
         """Tek batch'i işle"""
         results = {'sent': 0, 'failed': 0, 'errors': []}
 
@@ -131,15 +145,10 @@ class MessageSender:
     async def _send_single_message(self, target: Tuple) -> bool:
         """Tek hedefe mesaj gönder - GÜÇLENDIRILMIŞ ENTITY RESOLUTION"""
         try:
-            user_id, username, first_name, last_name = target
+            user_id, username, first_name, last_name = target[:4]
 
             # ID validation
-            if not user_id or not isinstance(user_id, int) or user_id <= 0:
-                logger.debug(f"Geçersiz user_id: {user_id}")
-                return False
-
-            if user_id >= 9999999999999999999:  # Çok büyük ID'ler
-                logger.debug(f"Çok büyük user_id: {user_id}")
+            if not self._is_valid_user_id(user_id):
                 return False
 
             # Aktif hesap al
@@ -156,106 +165,112 @@ class MessageSender:
             # Mesaj metnini hazırla
             message_text = self._prepare_message_text()
 
-            # DÜZELTILMIŞ: Güçlendirilmiş entity resolution
+            # Entity resolution
             entity = await self._resolve_target_entity(client, user_id, username)
 
             if not entity:
-                # Entity bulunamazsa başarısız kaydet
-                self.db.log_sent_message(
-                    sender_account_id=1,
-                    target_user_id=user_id,
-                    message_text=message_text,
-                    success=False,
-                    error_message="Entity not found"
-                )
+                self._log_failed_message(user_id, message_text, "Entity not found")
                 logger.debug(f"Entity bulunamadı: {user_id} (@{username})")
                 return False
 
             # Mesajı gönder
-            try:
-                await client.send_message(entity, message_text)
-
-                # Başarılı gönderimi kaydet
-                self.db.log_sent_message(
-                    sender_account_id=1,  # Account ID
-                    target_user_id=user_id,
-                    message_text=message_text,
-                    success=True
-                )
-
-                # İstatistikleri güncelle
-                self.account_manager.increment_message_count(account['session_name'])
-                self.session_stats['sent'] += 1
-                self.messages_sent_today += 1
-
-                display_name = first_name or username or f"ID:{user_id}"
-                logger.info(f"✅ Mesaj gönderildi: {display_name} <- {account['phone']}")
-                return True
-
-            except FloodWaitError as e:
-                logger.warning(f"⏳ Flood wait {account['session_name']}: {e.seconds}s")
-                await self.account_manager.handle_flood_wait(account['session_name'], e.seconds)
-
-                # Başarısız gönderimi kaydet
-                self.db.log_sent_message(
-                    sender_account_id=1,
-                    target_user_id=user_id,
-                    message_text=message_text,
-                    success=False,
-                    error_message=f"FloodWaitError: {e.seconds}s"
-                )
-                return False
-
-            except PeerFloodError:
-                logger.error(f"🚫 Peer flood {account['session_name']}")
-                await self.account_manager.handle_peer_flood(account['session_name'])
-
-                # Başarısız gönderimi kaydet
-                self.db.log_sent_message(
-                    sender_account_id=1,
-                    target_user_id=user_id,
-                    message_text=message_text,
-                    success=False,
-                    error_message="PeerFloodError"
-                )
-                return False
-
-            except (UserPrivacyRestrictedError, UserNotParticipantError,
-                    ChatWriteForbiddenError, UserBannedInChannelError,
-                    InputUserDeactivatedError, UserDeactivatedError) as e:
-                # Bu hatalar normal, kullanıcı ayarları
-                logger.debug(f"Kullanıcı erişilemez {user_id}: {type(e).__name__}")
-
-                # Başarısız gönderimi kaydet
-                self.db.log_sent_message(
-                    sender_account_id=1,
-                    target_user_id=user_id,
-                    message_text=message_text,
-                    success=False,
-                    error_message=type(e).__name__
-                )
-                return False
-
-            except Exception as e:
-                error_msg = str(e)
-                logger.debug(f"Mesaj gönderimi hatası {user_id}: {error_msg}")
-
-                # Başarısız gönderimi kaydet
-                self.db.log_sent_message(
-                    sender_account_id=1,
-                    target_user_id=user_id,
-                    message_text=message_text,
-                    success=False,
-                    error_message=error_msg
-                )
-                return False
+            return await self._send_message_to_entity(client, entity, message_text, account, target)
 
         except Exception as e:
             logger.error(f"❌ Genel gönderim hatası: {str(e)}")
             return False
 
+    def _is_valid_user_id(self, user_id: Union[int, str]) -> bool:
+        """User ID doğrulaması"""
+        try:
+            user_id = int(user_id)
+            return config.MIN_USER_ID <= user_id <= config.MAX_USER_ID
+        except (ValueError, TypeError):
+            return False
+
+    async def _send_message_to_entity(self, client: TelegramClient, entity, message_text: str,
+                                    account: Dict, target: Tuple) -> bool:
+        """Entity'ye mesaj gönder"""
+        user_id = target[0]
+        username = target[1] if len(target) > 1 else None
+        first_name = target[2] if len(target) > 2 else None
+
+        try:
+            await client.send_message(entity, message_text)
+
+            # Başarılı gönderimi kaydet
+            self._log_successful_message(user_id, message_text, account)
+
+            display_name = first_name or username or f"ID:{user_id}"
+            logger.info(f"✅ Mesaj gönderildi: {display_name} <- {account['phone']}")
+            return True
+
+        except FloodWaitError as e:
+            logger.warning(f"⏳ Flood wait {account['session_name']}: {e.seconds}s")
+            await self.account_manager.handle_flood_wait(account['session_name'], e.seconds)
+            self._log_failed_message(user_id, message_text, f"FloodWaitError: {e.seconds}s")
+            return False
+
+        except PeerFloodError:
+            logger.error(f"🚫 Peer flood {account['session_name']}")
+            await self.account_manager.handle_peer_flood(account['session_name'])
+            self._log_failed_message(user_id, message_text, "PeerFloodError")
+            return False
+
+        except (UserPrivacyRestrictedError, UserNotParticipantError,
+                ChatWriteForbiddenError, UserBannedInChannelError,
+                InputUserDeactivatedError, UserDeactivatedError,
+                UserIsBlockedError, ChatAdminRequiredError,
+                ChannelPrivateError) as e:
+            # Bu hatalar normal kullanıcı ayarları
+            logger.debug(f"Kullanıcı erişilemez {user_id}: {type(e).__name__}")
+            self._log_failed_message(user_id, message_text, type(e).__name__)
+            return False
+
+        except RPCError as e:
+            # Genel RPC hataları
+            logger.debug(f"RPC hatası {user_id}: {e}")
+            self._log_failed_message(user_id, message_text, f"RPCError: {e}")
+            return False
+
+        except Exception as e:
+            error_msg = str(e)
+            logger.debug(f"Mesaj gönderimi hatası {user_id}: {error_msg}")
+            self._log_failed_message(user_id, message_text, error_msg)
+            return False
+
+    def _log_successful_message(self, user_id: int, message_text: str, account: Dict):
+        """Başarılı mesaj kaydı"""
+        try:
+            self.db.log_sent_message(
+                sender_account_id=account.get('id', 1),
+                target_user_id=user_id,
+                message_text=message_text,
+                success=True
+            )
+
+            # İstatistikleri güncelle
+            self.account_manager.increment_message_count(account['session_name'])
+            self.session_stats['sent'] += 1
+            self.messages_sent_today += 1
+        except Exception as e:
+            logger.error(f"Başarılı mesaj kayıt hatası: {e}")
+
+    def _log_failed_message(self, user_id: int, message_text: str, error_message: str):
+        """Başarısız mesaj kaydı"""
+        try:
+            self.db.log_sent_message(
+                sender_account_id=1,
+                target_user_id=user_id,
+                message_text=message_text,
+                success=False,
+                error_message=error_message
+            )
+        except Exception as e:
+            logger.error(f"Başarısız mesaj kayıt hatası: {e}")
+
     async def _resolve_target_entity(self, client: TelegramClient, user_id: int, username: str = None):
-        """Güçlendirilmiş entity resolution - Sadece mevcut yöntemlerle"""
+        """Güçlendirilmiş entity resolution"""
         try:
             # Yöntem 1: Direkt user_id ile
             try:
@@ -263,27 +278,23 @@ class MessageSender:
                 if hasattr(entity, 'id') and entity.id == user_id:
                     logger.debug(f"✅ Entity bulundu (user_id): {user_id}")
                     return entity
-            except ValueError:
-                pass  # Devam et
+            except (ValueError, TypeError):
+                pass
 
             # Yöntem 2: Username ile (eğer varsa)
             if username and username.strip():
                 try:
-                    # @ işaretini temizle
                     clean_username = username.strip().replace('@', '')
                     entity = await client.get_entity(clean_username)
                     if hasattr(entity, 'id') and entity.id == user_id:
                         logger.debug(f"✅ Entity bulundu (username): @{clean_username}")
                         return entity
-                except ValueError:
+                except (ValueError, TypeError):
                     pass
 
-            # Yöntem 3: Input peer ile deneme (basit versiyon)
+            # Yöntem 3: Input peer ile deneme
             try:
-                from telethon.tl.types import InputPeerUser
-
-                # Bu risky ama bazen çalışır
-                input_peer = InputPeerUser(user_id, 0)  # Access hash 0 ile dene
+                input_peer = InputPeerUser(user_id, 0)
                 entity = await client.get_entity(input_peer)
                 if hasattr(entity, 'id') and entity.id == user_id:
                     logger.debug(f"✅ Entity bulundu (input_peer): {user_id}")
@@ -309,15 +320,14 @@ class MessageSender:
 
         # Basit çeşitlendirme
         if hasattr(config, 'MESSAGE_PREFIXES') and hasattr(config, 'MESSAGE_SUFFIXES'):
-            prefix = random.choice(config.MESSAGE_PREFIXES)
-            suffix = random.choice(config.MESSAGE_SUFFIXES)
-
             # %50 ihtimalle prefix ekle
             if random.random() < 0.5:
+                prefix = random.choice(config.MESSAGE_PREFIXES)
                 base_message = prefix + base_message
 
             # %30 ihtimalle suffix ekle
             if random.random() < 0.3:
+                suffix = random.choice(config.MESSAGE_SUFFIXES)
                 base_message = base_message + suffix
 
         return base_message
@@ -325,6 +335,10 @@ class MessageSender:
     async def send_test_message(self, target_user_id: int, custom_message: str = None) -> bool:
         """Test mesajı gönder"""
         try:
+            if not self._is_valid_user_id(target_user_id):
+                logger.error(f"❌ Geçersiz test user ID: {target_user_id}")
+                return False
+
             account = self._get_next_sender_account()
             if not account:
                 logger.error("❌ Test için aktif hesap yok!")
@@ -352,7 +366,7 @@ class MessageSender:
             logger.error(f"❌ Test mesajı hatası: {str(e)}")
             return False
 
-    def estimate_completion_time(self) -> Dict:
+    def estimate_completion_time(self) -> Dict[str, Union[int, float]]:
         """Tamamlanma zamanını tahmin et"""
         try:
             # Kalan hedef sayısını al
@@ -363,12 +377,14 @@ class MessageSender:
                 return {
                     'remaining_messages': 0,
                     'estimated_seconds': 0,
-                    'estimated_hours': 0
+                    'estimated_hours': 0.0,
+                    'active_senders': 0,
+                    'messages_per_hour': 0
                 }
 
             # Ortalama mesaj gönderim hızını hesapla
             avg_delay = (config.MESSAGE_DELAY_MIN + config.MESSAGE_DELAY_MAX) / 2
-            messages_per_hour = 3600 / avg_delay  # Saniyede mesaj sayısı * 3600
+            messages_per_hour = 3600 / avg_delay
 
             # Aktif hesap sayısını al
             active_senders = len([acc for acc in self.account_manager.active_accounts
@@ -397,7 +413,9 @@ class MessageSender:
             return {
                 'remaining_messages': 0,
                 'estimated_seconds': 0,
-                'estimated_hours': 0
+                'estimated_hours': 0.0,
+                'active_senders': 0,
+                'messages_per_hour': 0
             }
 
     async def check_sending_limits(self) -> bool:
@@ -422,7 +440,7 @@ class MessageSender:
             logger.error(f"❌ Limit kontrolü hatası: {str(e)}")
             return False
 
-    def get_sender_stats(self) -> Dict:
+    def get_sender_stats(self) -> Dict[str, Union[int, float]]:
         """Sender istatistiklerini getir"""
         try:
             db_stats = self.db.get_session_stats()
@@ -430,9 +448,9 @@ class MessageSender:
             return {
                 'session_sent': self.session_stats['sent'],
                 'session_failed': self.session_stats['failed'],
-                'total_sent_db': db_stats['sent_messages'],
-                'remaining_targets': db_stats['remaining_members'],
-                'messages_today': db_stats['messages_today'],
+                'total_sent_db': db_stats.get('sent_messages', 0),
+                'remaining_targets': db_stats.get('remaining_members', 0),
+                'messages_today': db_stats.get('messages_today', 0),
                 'active_accounts': len([acc for acc in self.account_manager.active_accounts
                                       if acc.get('role') == 'sender' and acc['is_active']]),
                 'errors_count': len(self.session_stats['errors'])
@@ -464,26 +482,4 @@ class MessageSender:
 
     async def validate_targets_before_sending(self, targets: List[Tuple]) -> List[Tuple]:
         """Gönderim öncesi hedefleri doğrula"""
-        valid_targets = []
-
-        for target in targets:
-            try:
-                user_id, username, first_name, last_name = target
-
-                # Temel validasyonlar
-                if not user_id or not isinstance(user_id, int) or user_id <= 0:
-                    logger.debug(f"Geçersiz user_id: {user_id}")
-                    continue
-
-                if user_id >= 9999999999999999999:
-                    logger.debug(f"Çok büyük user_id: {user_id}")
-                    continue
-
-                valid_targets.append(target)
-
-            except (ValueError, IndexError) as e:
-                logger.debug(f"Target parsing hatası: {e}")
-                continue
-
-        logger.info(f"🎯 Hedef validasyonu: {len(targets)} -> {len(valid_targets)} geçerli")
-        return valid_targets
+        return self._validate_targets(targets)
