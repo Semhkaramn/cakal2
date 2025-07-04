@@ -1,14 +1,15 @@
 """
-Telegram Komut Yöneticisi
+Telegram Komut Yöneticisi - DÜZELTILMIŞ VERSİYON
 Telegram'dan gelen komutları işler ve sistemi kontrol eder
 """
 
 import logging
 import asyncio
 from datetime import datetime
+from typing import Optional, Dict, Any, Union
 from telethon import TelegramClient, events
 from telethon.tl.types import User
-from telethon.errors import FloodWaitError
+from telethon.errors import FloodWaitError, RPCError
 import config
 
 logger = logging.getLogger(__name__)
@@ -18,7 +19,7 @@ class CommandHandler:
         self.app = app_instance
         self.status_reporter = status_reporter
         self.authorized_user_id = config.STATUS_USER_ID
-        self.command_client = None
+        self.command_client: Optional[TelegramClient] = None
         self.is_listening = False
 
         # Sistem durumları
@@ -29,9 +30,21 @@ class CommandHandler:
             'auto_mode': True
         }
 
+        # Komut istatistikleri
+        self.command_stats = {
+            'total_commands': 0,
+            'successful_commands': 0,
+            'failed_commands': 0,
+            'last_command_time': None
+        }
+
     async def setup_command_listener(self, client: TelegramClient):
         """Komut dinleyicisini kur"""
         try:
+            if not client:
+                logger.error("❌ Client sağlanmadı")
+                return False
+
             self.command_client = client
 
             # Komut event handler'ı kur
@@ -44,103 +57,124 @@ class CommandHandler:
 
             self.is_listening = True
             logger.info(f"🎮 Komut dinleyicisi kuruldu - Yetkili: {self.authorized_user_id}")
+            return True
 
         except Exception as e:
             logger.error(f"❌ Komut dinleyicisi kurulamadı: {str(e)}")
+            return False
 
     async def process_command(self, event):
         """Komut işle"""
         try:
-            command_text = event.raw_text.strip().lower()
+            command_text = event.raw_text.strip()
             user_id = event.sender_id
 
             logger.info(f"📟 Komut alındı: {command_text} - User: {user_id}")
 
+            # İstatistikleri güncelle
+            self.command_stats['total_commands'] += 1
+            self.command_stats['last_command_time'] = datetime.now()
+
             # Yetki kontrolü
-            if user_id != self.authorized_user_id:
+            if not self._is_authorized_user(user_id):
                 await self._safe_respond(event, "❌ Bu komutu kullanma yetkiniz yok!")
+                self.command_stats['failed_commands'] += 1
                 return
 
             # Komutları işle
-            response = await self.execute_command(command_text)
+            response = await self.execute_command(command_text.lower())
 
             if response:
-                await self._safe_respond(event, response)
+                success = await self._safe_respond(event, response)
+                if success:
+                    self.command_stats['successful_commands'] += 1
+                else:
+                    self.command_stats['failed_commands'] += 1
+            else:
+                self.command_stats['failed_commands'] += 1
 
         except Exception as e:
             logger.error(f"❌ Komut işleme hatası: {str(e)}")
+            self.command_stats['failed_commands'] += 1
             try:
-                await self._safe_respond(event, f"❌ Komut işlenirken hata: {str(e)}")
+                await self._safe_respond(event, f"❌ Komut işlenirken hata: {str(e)[:100]}")
             except:
                 logger.error("❌ Hata mesajı bile gönderilemedi")
 
-    async def _safe_respond(self, event, message: str):
+    def _is_authorized_user(self, user_id: int) -> bool:
+        """Kullanıcı yetkili mi kontrol et"""
+        return user_id == self.authorized_user_id
+
+    async def _safe_respond(self, event, message: str) -> bool:
         """Güvenli mesaj gönderimi"""
         try:
+            # Mesaj uzunluğunu kontrol et (Telegram limiti)
+            if len(message) > 4096:
+                message = message[:4093] + "..."
+
             await event.respond(message)
+            return True
+
         except FloodWaitError as e:
             logger.warning(f"⏳ Komut cevabı flood wait: {e.seconds}s")
             await asyncio.sleep(e.seconds)
-            await event.respond(message)
+            try:
+                await event.respond(message)
+                return True
+            except:
+                return False
+
         except OSError as e:
             logger.error(f"❌ Bağlantı hatası komut cevabında: {str(e)}")
+            return False
+
         except Exception as e:
             logger.error(f"❌ Komut cevap hatası: {str(e)}")
+            return False
 
-    async def execute_command(self, command: str) -> str:
+    async def execute_command(self, command: str) -> Optional[str]:
         """Komutları çalıştır"""
-        command = command.strip().lower()
+        try:
+            command = command.strip().lower()
 
-        if command == '/yardim' or command == '/start':
-            return self.get_help_text()
+            # Komut mapping
+            command_map = {
+                '/yardim': self.get_help_text,
+                '/start': self.get_help_text,
+                '/durum': self.get_status_info,
+                '/istatistik': self.get_detailed_stats,
+                '/toplamayidurdur': self.pause_collecting,
+                '/toplamabaslat': self.resume_collecting,
+                '/gonderimidurdur': self.pause_sending,
+                '/gonderimbaslat': self.resume_sending,
+                '/sistemidurdur': self.stop_system,
+                '/sistemibaslat': self.start_system,
+                '/veritemizle': self.reset_data,
+                '/mesajtemizle': self.reset_messages,
+                '/veritabani': self.get_database_info,
+                '/hesaplar': self.get_account_stats,
+                '/yeniden': self.restart_system,
+                '/tamtemizlik': self.full_cleanup
+            }
 
-        elif command == '/durum':
-            return await self.get_status_info()
+            # Mesaj değiştirme komutu özel işlem gerektirir
+            if command.startswith('/mesajdegistir'):
+                return await self.set_custom_message(command)
 
-        elif command == '/istatistik':
-            return await self.get_detailed_stats()
+            # Standart komutları çalıştır
+            if command in command_map:
+                handler = command_map[command]
+                if asyncio.iscoroutinefunction(handler):
+                    return await handler()
+                else:
+                    return handler()
 
-        elif command == '/toplamayidurdur':
-            return await self.pause_collecting()
-
-        elif command == '/toplamabaslat':
-            return await self.resume_collecting()
-
-        elif command == '/gonderimidurdur':
-            return await self.pause_sending()
-
-        elif command == '/gonderimbaslat':
-            return await self.resume_sending()
-
-        elif command == '/sistemidurdur':
-            return await self.stop_system()
-
-        elif command == '/sistemibaslat':
-            return await self.start_system()
-
-        elif command == '/veritemizle':
-            return await self.reset_data()
-
-        elif command == '/mesajtemizle':
-            return await self.reset_messages()
-
-        elif command == '/veritabani':
-            return await self.get_database_info()
-
-        elif command.startswith('/mesajdegistir'):
-            return await self.set_custom_message(command)
-
-        elif command == '/hesaplar':
-            return await self.get_account_stats()
-
-        elif command == '/yeniden':
-            return await self.restart_system()
-
-        elif command == '/tamtemizlik':
-            return await self.full_cleanup()
-
-        else:
+            # Bilinmeyen komut
             return f"❌ Bilinmeyen komut: {command}\n\n{self.get_help_text()}"
+
+        except Exception as e:
+            logger.error(f"❌ Komut çalıştırma hatası: {str(e)}")
+            return f"❌ Komut çalıştırma hatası: {str(e)[:100]}"
 
     def get_help_text(self) -> str:
         """Yardım metni"""
@@ -178,22 +212,22 @@ class CommandHandler:
 🎯 **Sistem SADECE ANLIK mesaj atanları toplar**
 📡 **Geçmiş tarama YOK - Sadece canlı dinleme**"""
 
-
     async def get_status_info(self) -> str:
         """Durum bilgisi"""
-        runtime = datetime.now() - self.app.start_time
-        hours = runtime.seconds // 3600
-        minutes = (runtime.seconds % 3600) // 60
+        try:
+            runtime = datetime.now() - self.app.start_time
+            hours = runtime.seconds // 3600
+            minutes = (runtime.seconds % 3600) // 60
 
-        status_icons = {
-            'system_running': '🟢' if self.system_states['system_running'] else '🔴',
-            'collecting': '🟢' if self.system_states['collecting_enabled'] else '🔴',
-            'sending': '🟢' if self.system_states['sending_enabled'] else '🔴'
-        }
+            status_icons = {
+                'system_running': '🟢' if self.system_states['system_running'] else '🔴',
+                'collecting': '🟢' if self.system_states['collecting_enabled'] else '🔴',
+                'sending': '🟢' if self.system_states['sending_enabled'] else '🔴'
+            }
 
-        db_stats = self.app.db.get_session_stats()
+            db_stats = self.app.db.get_session_stats()
 
-        return f"""📊 **SİSTEM DURUMU**
+            return f"""📊 **SİSTEM DURUMU**
 
 **🔧 Sistem Durumu:**
 {status_icons['system_running']} Sistem: {'ÇALIŞIYOR' if self.system_states['system_running'] else 'DURDURULDU'}
@@ -203,94 +237,130 @@ class CommandHandler:
 **⏱️ Çalışma Süresi:** {hours} saat {minutes} dakika
 
 **👥 Kullanıcı Sayıları:**
-• Aktif üyeler: {db_stats['active_members']}
-• Toplam benzersiz: {db_stats['total_unique_members']}
-• Kalan hedef: {db_stats['remaining_members']}
+• Aktif üyeler: {db_stats.get('active_members', 0):,}
+• Toplam benzersiz: {db_stats.get('total_unique_members', 0):,}
+• Kalan hedef: {db_stats.get('remaining_members', 0):,}
 
 **📤 Mesaj Durumu:**
-• Toplam gönderilen: {db_stats['sent_messages']}
-• Bu oturumda: {self.app.session_stats['sent_messages']}
+• Toplam gönderilen: {db_stats.get('sent_messages', 0):,}
+• Bu oturumda: {getattr(self.app, 'session_stats', {}).get('sent_messages', 0):,}
 
 **🎯 Günlük Özet:**
-• Bugün toplanan: {db_stats['new_members_today']}
-• Bugün gönderilen: {db_stats['messages_today']}"""
+• Bugün toplanan: {db_stats.get('new_members_today', 0):,}
+• Bugün gönderilen: {db_stats.get('messages_today', 0):,}"""
+
+        except Exception as e:
+            logger.error(f"❌ Status info hatası: {e}")
+            return f"❌ Durum bilgisi alınamadı: {str(e)[:100]}"
 
     async def get_detailed_stats(self) -> str:
         """Detaylı istatistikler"""
-        db_stats = self.app.db.get_session_stats()
-        account_stats = self.app.account_manager.get_account_stats()
+        try:
+            db_stats = self.app.db.get_session_stats()
+            account_stats = self.app.account_manager.get_account_stats()
 
-        account_list = []
-        for acc in account_stats['accounts']:
-            role = acc.get('role', 'unknown')
-            status = '🟢' if acc['is_active'] else '🔴'
-            account_list.append(f"{status} {acc['phone']} ({role}) - {acc['message_count']} mesaj")
+            account_list = []
+            for acc in account_stats.get('accounts', []):
+                role = acc.get('role', 'unknown')
+                status = '🟢' if acc.get('is_active') else '🔴'
+                phone = acc.get('phone', 'N/A')
+                msg_count = acc.get('message_count', 0)
+                account_list.append(f"{status} {phone} ({role}) - {msg_count} mesaj")
 
-        return f"""📈 **DETAYLI İSTATİSTİKLER**
+            account_text = '\n'.join(account_list[:10])  # İlk 10 hesap
+            if len(account_list) > 10:
+                account_text += f"\n... ve {len(account_list) - 10} hesap daha"
+
+            return f"""📈 **DETAYLI İSTATİSTİKLER**
 
 **📱 Hesap Durumları:**
-{chr(10).join(account_list)}
+{account_text or 'Hesap bulunamadı'}
 
 **📊 Veritabanı:**
-• Aktif üyeler: {db_stats['active_members']}
-• Static üyeler: {db_stats['static_members']}
-• Toplam benzersiz: {db_stats['total_unique_members']}
-• Kalan aktif hedef: {db_stats['remaining_active_members']}
-• Kalan static hedef: {db_stats['remaining_static_members']}
+• Aktif üyeler: {db_stats.get('active_members', 0):,}
+• Static üyeler: {db_stats.get('static_members', 0):,}
+• Toplam benzersiz: {db_stats.get('total_unique_members', 0):,}
+• Kalan aktif hedef: {db_stats.get('remaining_active_members', 0):,}
+• Kalan static hedef: {db_stats.get('remaining_static_members', 0):,}
 
 **📤 Mesaj İstatistikleri:**
-• Toplam başarılı: {db_stats['sent_messages']}
-• Bugün gönderilen: {db_stats['messages_today']}
-• Bugün başarısız: {db_stats['failed_today']}
-• Bugün başarı oranı: {db_stats['success_rate_today']}%
+• Toplam başarılı: {db_stats.get('sent_messages', 0):,}
+• Bugün gönderilen: {db_stats.get('messages_today', 0):,}
+• Bugün başarısız: {db_stats.get('failed_today', 0):,}
+• Bugün başarı oranı: {db_stats.get('success_rate_today', 100)}%
 
 **⚙️ Sistem Ayarları:**
 • Mesaj metni: {config.BASE_MESSAGE[:50]}...
 • Bekleme süresi: {config.MESSAGE_DELAY_MIN}-{config.MESSAGE_DELAY_MAX}s
 • Saatlik limit: {config.MESSAGES_PER_HOUR}
-• Collector grupları: {len(config.COLLECTOR_GROUPS)}"""
+• Collector grupları: {len(config.COLLECTOR_GROUPS)}
+
+**🎮 Komut İstatistikleri:**
+• Toplam komut: {self.command_stats['total_commands']}
+• Başarılı: {self.command_stats['successful_commands']}
+• Başarısız: {self.command_stats['failed_commands']}"""
+
+        except Exception as e:
+            logger.error(f"❌ Detailed stats hatası: {e}")
+            return f"❌ Detaylı istatistik alınamadı: {str(e)[:100]}"
 
     async def pause_collecting(self) -> str:
         """Veri toplamayı durdur"""
-        self.system_states['collecting_enabled'] = False
-        logger.info("⏸️ Veri toplama durduruldu")
-        return "⏸️ **VERİ TOPLAMA DURDURULDU**\n\nMesaj gönderimi devam ediyor.\nBaşlatmak için: /toplamabaslat"
+        try:
+            self.system_states['collecting_enabled'] = False
+            logger.info("⏸️ Veri toplama durduruldu")
+            return "⏸️ **VERİ TOPLAMA DURDURULDU**\n\nMesaj gönderimi devam ediyor.\nBaşlatmak için: /toplamabaslat"
+        except Exception as e:
+            return f"❌ Veri toplama durdurma hatası: {str(e)}"
 
     async def resume_collecting(self) -> str:
         """Veri toplamayı başlat"""
-        self.system_states['collecting_enabled'] = True
-        logger.info("▶️ Veri toplama başlatıldı")
-        return "▶️ **VERİ TOPLAMA BAŞLATILDI**\n\nSistem aktif kullanıcıları toplamaya devam ediyor."
+        try:
+            self.system_states['collecting_enabled'] = True
+            logger.info("▶️ Veri toplama başlatıldı")
+            return "▶️ **VERİ TOPLAMA BAŞLATILDI**\n\nSistem aktif kullanıcıları toplamaya devam ediyor."
+        except Exception as e:
+            return f"❌ Veri toplama başlatma hatası: {str(e)}"
 
     async def pause_sending(self) -> str:
         """Mesaj gönderimi durdur"""
-        self.system_states['sending_enabled'] = False
-        logger.info("⏸️ Mesaj gönderimi durduruldu")
-
-        # Aktif gönderim varsa bilgilendir
-        return "⏸️ **MESAJ GÖNDERİMİ DURDURULDU**\n\n✅ Devam eden gönderimler durduruldu\n📡 Canlı mesaj dinleme devam ediyor\n▶️ Başlatmak için: /gonderimbaslat"
+        try:
+            self.system_states['sending_enabled'] = False
+            logger.info("⏸️ Mesaj gönderimi durduruldu")
+            return "⏸️ **MESAJ GÖNDERİMİ DURDURULDU**\n\n✅ Devam eden gönderimler durduruldu\n📡 Canlı mesaj dinleme devam ediyor\n▶️ Başlatmak için: /gonderimbaslat"
+        except Exception as e:
+            return f"❌ Mesaj gönderimi durdurma hatası: {str(e)}"
 
     async def resume_sending(self) -> str:
         """Mesaj gönderimi başlat"""
-        self.system_states['sending_enabled'] = True
-        logger.info("▶️ Mesaj gönderimi başlatıldı")
-        return "▶️ **MESAJ GÖNDERİMİ BAŞLATILDI**\n\n✅ Sistem mesaj göndermeye devam ediyor\n📡 Canlı toplanan üyelere mesaj gönderilecek"
+        try:
+            self.system_states['sending_enabled'] = True
+            logger.info("▶️ Mesaj gönderimi başlatıldı")
+            return "▶️ **MESAJ GÖNDERİMİ BAŞLATILDI**\n\n✅ Sistem mesaj göndermeye devam ediyor\n📡 Canlı toplanan üyelere mesaj gönderilecek"
+        except Exception as e:
+            return f"❌ Mesaj gönderimi başlatma hatası: {str(e)}"
 
     async def stop_system(self) -> str:
         """Sistemi durdur"""
-        self.system_states['system_running'] = False
-        self.system_states['collecting_enabled'] = False
-        self.system_states['sending_enabled'] = False
-        logger.info("🛑 Sistem tamamen durduruldu")
-        return "🛑 **SİSTEM TAMAMEN DURDURULDU**\n\n❌ Tüm işlemler durduruldu\n❌ Canlı dinleme durdu\n❌ Mesaj gönderimi durdu\n▶️ Başlatmak için: /sistemibaslat"
+        try:
+            self.system_states['system_running'] = False
+            self.system_states['collecting_enabled'] = False
+            self.system_states['sending_enabled'] = False
+            logger.info("🛑 Sistem tamamen durduruldu")
+            return "🛑 **SİSTEM TAMAMEN DURDURULDU**\n\n❌ Tüm işlemler durduruldu\n❌ Canlı dinleme durdu\n❌ Mesaj gönderimi durdu\n▶️ Başlatmak için: /sistemibaslat"
+        except Exception as e:
+            return f"❌ Sistem durdurma hatası: {str(e)}"
 
     async def start_system(self) -> str:
         """Sistemi başlat"""
-        self.system_states['system_running'] = True
-        self.system_states['collecting_enabled'] = True
-        self.system_states['sending_enabled'] = True
-        logger.info("🚀 Sistem başlatıldı")
-        return "🚀 **SİSTEM BAŞLATILDI**\n\nTüm işlemler aktif!"
+        try:
+            self.system_states['system_running'] = True
+            self.system_states['collecting_enabled'] = True
+            self.system_states['sending_enabled'] = True
+            logger.info("🚀 Sistem başlatıldı")
+            return "🚀 **SİSTEM BAŞLATILDI**\n\nTüm işlemler aktif!"
+        except Exception as e:
+            return f"❌ Sistem başlatma hatası: {str(e)}"
 
     async def reset_data(self) -> str:
         """Tüm verileri sıfırla"""
@@ -318,7 +388,14 @@ class CommandHandler:
             if len(parts) < 2:
                 return "❌ Kullanım: /mesajdegistir [yeni mesaj metni]"
 
-            new_message = parts[1]
+            new_message = parts[1].strip()
+            if not new_message:
+                return "❌ Boş mesaj metni girilemez"
+
+            if len(new_message) > 500:
+                return "❌ Mesaj metni çok uzun (max 500 karakter)"
+
+            # Global config'i güncelle
             config.BASE_MESSAGE = new_message
 
             logger.info(f"📝 Mesaj metni değiştirildi: {new_message}")
@@ -329,37 +406,44 @@ class CommandHandler:
 
     async def get_account_stats(self) -> str:
         """Hesap istatistikleri"""
-        account_stats = self.app.account_manager.get_account_stats()
+        try:
+            account_stats = self.app.account_manager.get_account_stats()
 
-        collector_accounts = []
-        sender_accounts = []
+            collector_accounts = []
+            sender_accounts = []
 
-        for acc in account_stats['accounts']:
-            role = acc.get('role', 'unknown')
-            status = '🟢 AKTİF' if acc['is_active'] else '🔴 DEAKTİF'
-            phone = acc['phone']
-            name = acc['name']
-            msg_count = acc['message_count']
+            for acc in account_stats.get('accounts', []):
+                role = acc.get('role', 'unknown')
+                status = '🟢 AKTİF' if acc.get('is_active') else '🔴 DEAKTİF'
+                phone = acc.get('phone', 'N/A')
+                name = acc.get('name', 'N/A')
+                msg_count = acc.get('message_count', 0)
 
-            account_info = f"{status}\n📞 {phone}\n👤 {name}\n📤 {msg_count} mesaj"
+                account_info = f"{status}\n📞 {phone}\n👤 {name}\n📤 {msg_count} mesaj"
 
-            if role == 'collector':
-                collector_accounts.append(account_info)
-            else:
-                sender_accounts.append(account_info)
+                if role == 'collector':
+                    collector_accounts.append(account_info)
+                else:
+                    sender_accounts.append(account_info)
 
-        result = "📱 **HESAP DURUMU**\n\n"
+            result = "📱 **HESAP DURUMU**\n\n"
 
-        if collector_accounts:
-            result += "📡 **COLLECTOR HESABI:**\n"
-            result += "\n".join(collector_accounts) + "\n\n"
+            if collector_accounts:
+                result += "📡 **COLLECTOR HESABI:**\n"
+                result += "\n".join(collector_accounts) + "\n\n"
 
-        if sender_accounts:
-            result += "📤 **SENDER HESAPLARI:**\n"
-            for i, acc in enumerate(sender_accounts, 1):
-                result += f"**Sender {i}:**\n{acc}\n\n"
+            if sender_accounts:
+                result += "📤 **SENDER HESAPLARI:**\n"
+                for i, acc in enumerate(sender_accounts, 1):
+                    result += f"**Sender {i}:**\n{acc}\n\n"
 
-        return result
+            if not collector_accounts and not sender_accounts:
+                result += "❌ Aktif hesap bulunamadı"
+
+            return result
+
+        except Exception as e:
+            return f"❌ Hesap istatistikleri alınamadı: {str(e)}"
 
     async def get_database_info(self) -> str:
         """Heroku PostgreSQL bilgilerini getir"""
@@ -373,20 +457,64 @@ class CommandHandler:
             for table, count in db_info.get('table_counts', {}).items():
                 table_info += f"• {table}: {count:,} kayıt\n"
 
+            version_short = db_info.get('version', 'Bilinmiyor')[:100]
+            size = db_info.get('database_size', 'Bilinmiyor')
+
             return f"""🗄️ **HEROKU POSTGRESQL BİLGİSİ**
 
 📊 **Database:**
-• Boyut: {db_info.get('database_size', 'Bilinmiyor')}
-• Versiyon: {db_info.get('version', 'Bilinmiyor')[:100]}
+• Boyut: {size}
+• Versiyon: {version_short}
 
 📋 **Tablo Durumu:**
-{table_info}
+{table_info or 'Tablo bilgisi bulunamadı'}
 
 ✅ **Durum:** Heroku PostgreSQL aktif ve çalışıyor"""
 
         except Exception as e:
-            return f"❌ **DATABASE BİLGİSİ HATASI**\n\n{str(e)}"
+            return f"❌ **DATABASE BİLGİSİ HATASI**\n\n{str(e)[:200]}"
 
+    async def restart_system(self) -> str:
+        """Sistemi yeniden başlat"""
+        try:
+            # Önce durdur
+            self.system_states['system_running'] = False
+            self.system_states['collecting_enabled'] = False
+            self.system_states['sending_enabled'] = False
+
+            await asyncio.sleep(2)  # Kısa bekleme
+
+            # Sonra başlat
+            self.system_states['system_running'] = True
+            self.system_states['collecting_enabled'] = True
+            self.system_states['sending_enabled'] = True
+
+            logger.info("🔄 Sistem yeniden başlatıldı")
+            return "🔄 **SİSTEM YENİDEN BAŞLATILDI**\n\nTüm işlemler yeniden başlatıldı."
+        except Exception as e:
+            return f"❌ Sistem yeniden başlatma hatası: {str(e)}"
+
+    async def full_cleanup(self) -> str:
+        """Tüm verileri ve sistemleri temizle"""
+        try:
+            # Verileri temizle
+            self.app.db.reset_all_data()
+            self.app.account_manager.reset_account_data()
+
+            # İstatistikleri sıfırla
+            self.command_stats = {
+                'total_commands': 0,
+                'successful_commands': 0,
+                'failed_commands': 0,
+                'last_command_time': None
+            }
+
+            logger.info("🗑️ Tüm veriler ve sistem temizlendi")
+            return "🗑️ **TÜM VERİLER VE SİSTEM TEMİZLENDİ**\n\n• Toplanan kullanıcılar silindi\n• Mesaj kayıtları silindi\n• Hesap istatistikleri sıfırlandı\n• Komut istatistikleri sıfırlandı\n• Sistem sıfırdan başlayacak"
+        except Exception as e:
+            return f"❌ Tam temizlik hatası: {str(e)}"
+
+    # Status checker methods
     def is_collecting_enabled(self) -> bool:
         """Veri toplama aktif mi?"""
         return self.system_states['collecting_enabled'] and self.system_states['system_running']
@@ -399,20 +527,10 @@ class CommandHandler:
         """Sistem çalışıyor mu?"""
         return self.system_states['system_running']
 
-    async def restart_system(self) -> str:
-        """Sistemi yeniden başlat"""
-        self.system_states['system_running'] = False
-        self.system_states['collecting_enabled'] = False
-        self.system_states['sending_enabled'] = False
-        logger.info("🔄 Sistem yeniden başlatıldı")
-        return "🔄 **SİSTEM YENİDEN BAŞLATILDI**\n\nTüm işlemler yeniden başlatıldı."
+    def get_system_states(self) -> Dict[str, bool]:
+        """Sistem durumlarını getir"""
+        return self.system_states.copy()
 
-    async def full_cleanup(self) -> str:
-        """Tüm verileri ve sistemleri temizle"""
-        try:
-            self.app.db.reset_all_data()
-            self.app.account_manager.reset_account_data()
-            logger.info("🗑️ Tüm veriler ve sistem temizlendi")
-            return "🗑️ **TÜM VERİLER VE SİSTEM TEMİZLENDİ**\n\n• Toplanan kullanıcılar silindi\n• Mesaj kayıtları silindi\n• Sistem sıfırdan başlayacak"
-        except Exception as e:
-            return f"❌ Veri ve sistem temizleme hatası: {str(e)}"
+    def get_command_stats(self) -> Dict[str, Union[int, Optional[datetime]]]:
+        """Komut istatistiklerini getir"""
+        return self.command_stats.copy()
