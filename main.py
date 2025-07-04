@@ -1,5 +1,5 @@
 """
-Telegram Mass Messenger - Ana Program
+Telegram Mass Messenger - Ana Program - DÜZELTILMIŞ VERSİYON
 Tamamen otomatik çalışan sistem (Heroku için optimize)
 """
 
@@ -9,6 +9,7 @@ import sys
 import os
 import signal
 from datetime import datetime, timedelta
+from typing import Dict, Optional, Any, Union
 
 # Kendi modüllerimizi import et
 from database import DatabaseManager
@@ -27,186 +28,318 @@ class TelegramMassMessenger:
     def __init__(self):
         logger.info("🚀 Telegram Mass Messenger başlatılıyor...")
 
-        self.db = DatabaseManager()
-        self.account_manager = AccountManager()
-        self.collector = MessageCollector(self.db)
-        self.sender = MessageSender(self.db, self.account_manager)
-        self.scraper = GroupScraper(self.db)
-        self.status_reporter = None
-        self.command_handler = None
+        # Ana bileşenler
+        self.db: Optional[DatabaseManager] = None
+        self.account_manager: Optional[AccountManager] = None
+        self.collector: Optional[MessageCollector] = None
+        self.sender: Optional[MessageSender] = None
+        self.scraper: Optional[GroupScraper] = None
+        self.status_reporter: Optional[StatusReporter] = None
+        self.command_handler: Optional[CommandHandler] = None
+
+        # Sistem durumu
         self.running = False
         self.start_time = datetime.now()
+
+        # Session istatistikleri
         self.session_stats = {
             'collected_users': 0,
             'sent_messages': 0,
             'failed_messages': 0,
-            'errors': []
+            'errors': [],
+            'cycles_completed': 0
         }
+
+        # Önceki active count tracking
+        self._previous_active_count = 0
 
     async def initialize(self) -> bool:
         """Sistemi başlat"""
         logger.info("🚀 Sistem başlatılıyor...")
 
-        # Veri sıfırlama kontrolü
-        if config.RESET_DATA:
-            logger.info("🗑️ Veri sıfırlama aktif - tüm veriler temizleniyor...")
-            self.db.reset_all_data()
+        try:
+            # 1. Database'i başlat
+            if not await self._initialize_database():
+                return False
 
-        # Session dosyalarını kontrol et
-        session_files = utils.check_session_files()
+            # 2. Account manager'ı başlat
+            if not await self._initialize_account_manager():
+                return False
 
-        if not session_files:
-            logger.error("❌ Session dosyası bulunamadı!")
+            # 3. Diğer bileşenleri başlat
+            if not await self._initialize_components():
+                return False
+
+            # 4. Status ve command handler'ları başlat
+            if not await self._initialize_status_and_commands():
+                return False
+
+            # 5. Collector'ı kur
+            if not await self._setup_collector():
+                return False
+
+            logger.info(f"✅ Sistem başarıyla başlatıldı - {len(self.account_manager.active_accounts)} hesap aktif")
+            return True
+
+        except Exception as e:
+            logger.error(f"❌ Sistem başlatma hatası: {str(e)}")
             return False
 
-        logger.info(f"📁 {len(session_files)} session dosyası bulundu")
+    async def _initialize_database(self) -> bool:
+        """Database'i başlat"""
+        try:
+            logger.info("🗄️ Database başlatılıyor...")
+            self.db = DatabaseManager()
 
-        # Hesapları başlat
-        logger.info("🔄 Hesaplar başlatılıyor...")
-        success = await self.account_manager.initialize_clients()
+            # Veri sıfırlama kontrolü
+            if config.RESET_DATA:
+                logger.info("🗑️ Veri sıfırlama aktif - tüm veriler temizleniyor...")
+                self.db.reset_all_data()
 
-        if not success:
-            logger.error("❌ Hiç hesap başlatılamadı!")
+            return True
+        except Exception as e:
+            logger.error(f"❌ Database başlatma hatası: {str(e)}")
             return False
 
-        # Status reporter ve command handler'ı başlat (ilk hesabı kullan)
-        if self.account_manager.active_accounts:
+    async def _initialize_account_manager(self) -> bool:
+        """Account manager'ı başlat"""
+        try:
+            logger.info("📱 Account manager başlatılıyor...")
+
+            # Session dosyalarını kontrol et
+            session_files = utils.check_session_files()
+            if not session_files:
+                logger.error("❌ Session dosyası bulunamadı!")
+                return False
+
+            logger.info(f"📁 {len(session_files)} session dosyası bulundu")
+
+            # Account manager'ı başlat
+            self.account_manager = AccountManager()
+            success = await self.account_manager.initialize_clients()
+
+            if not success:
+                logger.error("❌ Hiç hesap başlatılamadı!")
+                return False
+
+            return True
+        except Exception as e:
+            logger.error(f"❌ Account manager başlatma hatası: {str(e)}")
+            return False
+
+    async def _initialize_components(self) -> bool:
+        """Diğer bileşenleri başlat"""
+        try:
+            logger.info("🔧 Bileşenler başlatılıyor...")
+
+            self.collector = MessageCollector(self.db)
+            self.sender = MessageSender(self.db, self.account_manager)
+            self.scraper = GroupScraper(self.db)
+
+            return True
+        except Exception as e:
+            logger.error(f"❌ Bileşen başlatma hatası: {str(e)}")
+            return False
+
+    async def _initialize_status_and_commands(self) -> bool:
+        """Status reporter ve command handler'ı başlat"""
+        try:
+            if not self.account_manager.active_accounts:
+                logger.error("❌ Aktif hesap yok")
+                return False
+
+            # İlk hesabı status ve command için kullan
             first_account = self.account_manager.active_accounts[0]
             status_client = self.account_manager.get_active_client(first_account['session_name'])
 
+            if not status_client:
+                logger.error("❌ Status client alınamadı")
+                return False
+
             # Status reporter'ı başlat
+            logger.info("📊 Status reporter başlatılıyor...")
             self.status_reporter = StatusReporter(status_client)
 
             # Command handler'ı başlat
+            logger.info("🎮 Command handler başlatılıyor...")
             self.command_handler = CommandHandler(self, self.status_reporter)
-            await self.command_handler.setup_command_listener(status_client)
 
-            # ⭐ ÖNEMLİ: Message sender'a command handler referansını ver
+            command_setup_success = await self.command_handler.setup_command_listener(status_client)
+            if not command_setup_success:
+                logger.warning("⚠️ Command handler kurulamadı, devam ediliyor...")
+
+            # Message sender'a command handler referansını ver
             self.sender.set_command_handler(self.command_handler)
 
             # Başlangıç status mesajı gönder
-            await self.status_reporter.send_startup_status(
-                len(self.account_manager.active_accounts),
-                config.COLLECTOR_GROUPS
-            )
+            try:
+                await self.status_reporter.send_startup_status(
+                    len(self.account_manager.active_accounts),
+                    config.COLLECTOR_GROUPS
+                )
 
-            # Komut menüsünü gönder
-            help_text = self.command_handler.get_help_text()
-            await self.status_reporter.send_status(f"🎮 **KOMUTLAR HAZIR**\n\n{help_text}", force=True)
+                # Komut menüsünü gönder
+                if self.command_handler:
+                    help_text = self.command_handler.get_help_text()
+                    await self.status_reporter.send_status(f"🎮 **KOMUTLAR HAZIR**\n\n{help_text}", force=True)
 
-        logger.info(f"✅ {len(self.account_manager.active_accounts)} hesap başarıyla başlatıldı")
-        return True
+            except Exception as e:
+                logger.warning(f"⚠️ Status mesajı gönderilemedi: {str(e)}")
+
+            return True
+
+        except Exception as e:
+            logger.error(f"❌ Status/Command başlatma hatası: {str(e)}")
+            return False
+
+    async def _setup_collector(self) -> bool:
+        """Collector'ı kur"""
+        try:
+            if not config.COLLECTOR_GROUPS:
+                logger.error("❌ COLLECTOR_GROUPS boş!")
+                return False
+
+            # Collector client'ı account_manager'dan al
+            collector_session = config.COLLECTOR_SESSION
+            collector_client = self.account_manager.get_active_client(collector_session)
+
+            if not collector_client:
+                logger.error(f"❌ Collector client bulunamadı: {collector_session}")
+                return False
+
+            # Collector'ın client'ını ata
+            self.collector.client = collector_client
+
+            # Grupları ekle ve entity cache'le
+            successful_groups = 0
+            for group in config.COLLECTOR_GROUPS:
+                if group and group.strip():
+                    try:
+                        success = await self.collector.add_monitoring_group(group.strip())
+                        if success:
+                            logger.info(f"✅ Grup eklendi: {group}")
+                            successful_groups += 1
+
+                            # Entity caching yap (mesaj gönderimi için hazırlık)
+                            try:
+                                cached_count = await self.collector.cache_group_entities(group.strip(), limit=200)
+                                logger.info(f"📦 {group} için {cached_count} entity cache'lendi")
+                            except Exception as e:
+                                logger.warning(f"⚠️ Entity caching hatası {group}: {str(e)}")
+                        else:
+                            logger.warning(f"❌ Grup eklenemedi: {group}")
+                    except Exception as e:
+                        logger.error(f"❌ Grup ekleme hatası {group}: {str(e)}")
+
+            if successful_groups == 0:
+                logger.error("❌ Hiç grup eklenemedi!")
+                return False
+
+            logger.info(f"✅ {successful_groups}/{len(config.COLLECTOR_GROUPS)} grup başarıyla eklendi")
+            return True
+
+        except Exception as e:
+            logger.error(f"❌ Collector setup hatası: {str(e)}")
+            return False
 
     async def run_auto_mode(self):
         """Tamamen otomatik mod - Komutlarla kontrol edilebilir"""
         logger.info("🤖 Otomatik mod başlatılıyor...")
 
         try:
-            # Collector'ı kur
-            await self.setup_auto_collector()
             self.running = True
+            cycle_count = 0
 
             while self.running:
+                cycle_count += 1
+                cycle_start = datetime.now()
+
+                logger.info(f"🔄 Cycle {cycle_count} başlatılıyor...")
+
                 # Sistem durdurulmuşsa bekle
                 if self.command_handler and not self.command_handler.is_system_running():
                     logger.info("⏸️ Sistem durduruldu, bekleniyor...")
                     await asyncio.sleep(30)
                     continue
 
-                cycle_start = datetime.now()
-
                 # 1. Collection fazı (eğer aktif ise)
+                collection_stats = {}
                 if not self.command_handler or self.command_handler.is_collecting_enabled():
                     logger.info("📡 Collection fazı başlatılıyor...")
                     collection_stats = await self.run_auto_collection()
 
-                    if self.status_reporter:
-                        await self.status_reporter.send_collector_status(collection_stats)
+                    if self.status_reporter and collection_stats:
+                        try:
+                            await self.status_reporter.send_collector_status(collection_stats)
+                        except Exception as e:
+                            logger.warning(f"⚠️ Collector status gönderilemedi: {str(e)}")
                 else:
                     logger.info("⏸️ Collection deaktif, atlanıyor...")
 
                 # 2. Sending fazı (eğer aktif ise)
+                sending_stats = {}
                 if not self.command_handler or self.command_handler.is_sending_enabled():
                     logger.info("📤 Sending fazı başlatılıyor...")
                     sending_stats = await self.run_auto_sending()
 
-                    if self.status_reporter:
-                        await self.status_reporter.send_sender_status(sending_stats)
+                    if self.status_reporter and sending_stats:
+                        try:
+                            await self.status_reporter.send_sender_status(sending_stats)
+                        except Exception as e:
+                            logger.warning(f"⚠️ Sender status gönderilemedi: {str(e)}")
                 else:
                     logger.info("⏸️ Sending deaktif, atlanıyor...")
 
                 # 3. Status raporu
-                await self.send_periodic_status()
+                await self.send_periodic_status(cycle_count)
 
-                # 4. Cycle tamamlandı, bekleme
+                # 4. Cycle tamamlandı
+                self.session_stats['cycles_completed'] = cycle_count
                 cycle_duration = (datetime.now() - cycle_start).seconds
                 sleep_time = max(300, config.STATUS_INTERVAL - cycle_duration)  # Min 5 dk
 
-                logger.info(f"⏳ Cycle tamamlandı, {sleep_time} saniye bekleniyor...")
+                logger.info(f"✅ Cycle {cycle_count} tamamlandı ({cycle_duration}s), {sleep_time} saniye bekleniyor...")
                 await asyncio.sleep(sleep_time)
 
+        except KeyboardInterrupt:
+            logger.info("⏹️ Sistem kullanıcı tarafından durduruldu")
         except Exception as e:
             logger.error(f"❌ Otomatik mod hatası: {str(e)}")
             if self.status_reporter:
-                await self.status_reporter.send_error_status("Auto Mode Error", str(e))
+                try:
+                    await self.status_reporter.send_error_status("Auto Mode Error", str(e))
+                except:
+                    pass
+        finally:
+            self.running = False
 
-    async def setup_auto_collector(self):
-        """Otomatik collector kurulumu"""
-        if not config.COLLECTOR_GROUPS:
-            logger.error("❌ COLLECTOR_GROUPS boş!")
-            return False
-
-        # Collector client'ı account_manager'dan al (zaten başlatılmış)
-        collector_session = config.COLLECTOR_SESSION
-        collector_client = self.account_manager.get_active_client(collector_session)
-
-        if not collector_client:
-            logger.error(f"❌ Collector client bulunamadı: {collector_session}")
-            return False
-
-        # Collector'ın client'ını ata
-        self.collector.client = collector_client
-
-        # Grupları ekle ve entity cache'le
-        for group in config.COLLECTOR_GROUPS:
-            if group.strip():
-                success = await self.collector.add_monitoring_group(group.strip())
-                if success:
-                    logger.info(f"✅ Grup eklendi: {group}")
-
-                    # Entity caching yap (mesaj gönderimi için hazırlık)
-                    try:
-                        cached_count = await self.collector.cache_group_entities(group.strip(), limit=200)
-                        logger.info(f"📦 {group} için {cached_count} entity cache'lendi")
-                    except Exception as e:
-                        logger.warning(f"⚠️ Entity caching hatası {group}: {str(e)}")
-                else:
-                    logger.warning(f"❌ Grup eklenemedi: {group}")
-
-        return True
-
-    async def run_auto_collection(self) -> dict:
+    async def run_auto_collection(self) -> Dict[str, Union[int, str]]:
         """Otomatik collection - SADECE CANLI DİNLEME"""
-        stats = {'session_collected': 0, 'total_collected': 0}
+        stats = {'session_collected': 0, 'total_collected': 0, 'last_collection_time': 'N/A'}
 
         try:
             # ⚠️ GEÇMİŞ MESAJ TARAMA KAPALI
             logger.info("📡 Sadece canlı mesaj dinleme aktif (geçmiş tarama YOK)")
 
             # Canlı dinleme zaten kurulu, sadece istatistik güncellemesi yap
-            # Yeni toplanan üye sayısını al (son 5 dakikadaki canlı mesajlar)
             db_stats = self.db.get_session_stats()
 
             # Bu session'da kaç kişi toplandığını hesapla
-            current_active = db_stats['active_members']
-            previous_active = getattr(self, '_previous_active_count', 0)
-            session_collected = max(0, current_active - previous_active)
+            current_active = db_stats.get('active_members', 0)
+            session_collected = max(0, current_active - self._previous_active_count)
 
-            stats['session_collected'] = session_collected
-            stats.update(db_stats)
+            stats.update({
+                'session_collected': session_collected,
+                'total_collected': current_active,
+                'last_collection_time': datetime.now().strftime('%H:%M:%S'),
+                **db_stats
+            })
 
             # Sonraki karşılaştırma için kaydet
             self._previous_active_count = current_active
+
+            # Session stats güncelle
+            self.session_stats['collected_users'] += session_collected
 
             if session_collected > 0:
                 logger.info(f"📊 Canlı dinleme: {session_collected} yeni aktif üye")
@@ -216,17 +349,23 @@ class TelegramMassMessenger:
         except Exception as e:
             logger.error(f"❌ Canlı dinleme kontrolü hatası: {str(e)}")
             if self.status_reporter:
-                await self.status_reporter.send_error_status("Live Listening Error", str(e))
+                try:
+                    await self.status_reporter.send_error_status("Live Listening Error", str(e))
+                except:
+                    pass
 
         return stats
 
-    async def run_auto_sending(self) -> dict:
+    async def run_auto_sending(self) -> Dict[str, Union[int, str]]:
         """Otomatik mesaj gönderimi"""
         stats = {
             'session_sent': 0,
             'session_failed': 0,
             'success_rate': 0,
-            'estimated_time': 'N/A'
+            'estimated_time': 'N/A',
+            'total_sent_db': 0,
+            'remaining_targets': 0,
+            'active_accounts': 0
         }
 
         try:
@@ -249,74 +388,160 @@ class TelegramMassMessenger:
                 # Mesaj gönder
                 results = await self.sender.send_messages_batch(targets, config.BATCH_SIZE)
 
-                stats['session_sent'] = results['sent']
-                stats['session_failed'] = results['failed']
+                stats.update({
+                    'session_sent': results.get('sent', 0),
+                    'session_failed': results.get('failed', 0),
+                    'total_targets': results.get('total_targets', 0)
+                })
 
                 # Başarı oranını hesapla
-                total = results['sent'] + results['failed']
+                total = stats['session_sent'] + stats['session_failed']
                 if total > 0:
-                    stats['success_rate'] = int((results['sent'] / total) * 100)
+                    stats['success_rate'] = int((stats['session_sent'] / total) * 100)
 
                 # Session stats güncelle
-                self.session_stats['sent_messages'] += results['sent']
-                self.session_stats['failed_messages'] += results['failed']
+                self.session_stats['sent_messages'] += stats['session_sent']
+                self.session_stats['failed_messages'] += stats['session_failed']
 
-                logger.info(f"📊 Gönderim tamamlandı: {results['sent']} başarılı, {results['failed']} başarısız")
+                logger.info(f"📊 Gönderim tamamlandı: {stats['session_sent']} başarılı, {stats['session_failed']} başarısız")
 
                 # Tahmini süre
-                estimation = self.sender.estimate_completion_time()
-                if estimation['remaining_messages'] > 0:
-                    stats['estimated_time'] = utils.format_time_remaining(estimation['estimated_seconds'])
+                try:
+                    estimation = self.sender.estimate_completion_time()
+                    if estimation.get('remaining_messages', 0) > 0:
+                        stats['estimated_time'] = utils.format_time_remaining(estimation.get('estimated_seconds', 0))
+
+                    # Ek istatistikler
+                    sender_stats = self.sender.get_sender_stats()
+                    stats.update({
+                        'total_sent_db': sender_stats.get('total_sent_db', 0),
+                        'remaining_targets': sender_stats.get('remaining_targets', 0),
+                        'active_accounts': sender_stats.get('active_accounts', 0)
+                    })
+
+                except Exception as e:
+                    logger.warning(f"⚠️ Tahmini süre hesaplanamadı: {str(e)}")
             else:
                 logger.info("📭 Gönderilecek hedef bulunamadı")
+
+                # Yine de istatistikleri al
+                try:
+                    sender_stats = self.sender.get_sender_stats()
+                    stats.update({
+                        'total_sent_db': sender_stats.get('total_sent_db', 0),
+                        'remaining_targets': sender_stats.get('remaining_targets', 0),
+                        'active_accounts': sender_stats.get('active_accounts', 0)
+                    })
+                except Exception as e:
+                    logger.warning(f"⚠️ Sender stats alınamadı: {str(e)}")
 
         except Exception as e:
             logger.error(f"❌ Sending hatası: {str(e)}")
             if self.status_reporter:
-                await self.status_reporter.send_error_status("Sending Error", str(e))
+                try:
+                    await self.status_reporter.send_error_status("Sending Error", str(e))
+                except:
+                    pass
 
         return stats
 
-    async def send_periodic_status(self):
+    async def send_periodic_status(self, cycle_count: int):
         """Periyodik durum raporu gönder"""
-        if self.status_reporter:
-            try:
+        if not self.status_reporter:
+            return
+
+        try:
+            # Her 5 cycle'da bir detaylı rapor gönder
+            if cycle_count % 5 == 0:
                 db_stats = self.db.get_session_stats()
 
-                status_message = f"""📊 **PERİYODİK RAPOR**
+                status_message = f"""📊 **PERİYODİK RAPOR** (Cycle {cycle_count})
 
 👥 **Kullanıcı Durumu:**
-• Aktif üyeler: {db_stats['active_members']:,}
-• Kalan hedef: {db_stats['remaining_members']:,}
+• Aktif üyeler: {db_stats.get('active_members', 0):,}
+• Kalan hedef: {db_stats.get('remaining_members', 0):,}
 
 📤 **Mesaj Durumu:**
-• Toplam gönderilen: {db_stats['sent_messages']:,}
-• Bugün gönderilen: {db_stats['messages_today']:,}
+• Toplam gönderilen: {db_stats.get('sent_messages', 0):,}
+• Bugün gönderilen: {db_stats.get('messages_today', 0):,}
+• Bu oturumda: {self.session_stats['sent_messages']:,}
 
-⏱️ **Çalışma Süresi:** {self.get_uptime()}
+⏱️ **Sistem Bilgisi:**
+• Çalışma süresi: {self.get_uptime()}
+• Tamamlanan cycle: {cycle_count}
+• Toplanan üye (session): {self.session_stats['collected_users']:,}
+
 🔄 **Durum:** Sistem aktif çalışıyor"""
 
                 await self.status_reporter.send_status(status_message)
 
-            except Exception as e:
-                logger.error(f"Status raporu hatası: {e}")
+        except Exception as e:
+            logger.error(f"Status raporu hatası: {e}")
 
     def get_uptime(self) -> str:
         """Çalışma süresini formatla"""
-        uptime = datetime.now() - self.start_time
-        hours = uptime.seconds // 3600
-        minutes = (uptime.seconds % 3600) // 60
-        return f"{uptime.days} gün {hours} saat {minutes} dakika"
+        try:
+            uptime = datetime.now() - self.start_time
+            days = uptime.days
+            hours = uptime.seconds // 3600
+            minutes = (uptime.seconds % 3600) // 60
+
+            if days > 0:
+                return f"{days} gün {hours} saat {minutes} dakika"
+            elif hours > 0:
+                return f"{hours} saat {minutes} dakika"
+            else:
+                return f"{minutes} dakika"
+        except Exception:
+            return "Hesaplanamadı"
 
     async def cleanup(self):
         """Temizlik işlemleri"""
         try:
+            logger.info("🧹 Temizlik başlatılıyor...")
+
             self.running = False
-            await self.account_manager.disconnect_all()
-            await self.collector.stop_collecting()
+
+            # Database connections'ı kapat
+            if self.db:
+                try:
+                    self.db.close_connections()
+                except Exception as e:
+                    logger.error(f"Database kapatma hatası: {e}")
+
+            # Account manager'ı temizle
+            if self.account_manager:
+                try:
+                    await self.account_manager.disconnect_all()
+                except Exception as e:
+                    logger.error(f"Account disconnect hatası: {e}")
+
+            # Collector'ı durdur
+            if self.collector:
+                try:
+                    await self.collector.stop_collecting()
+                except Exception as e:
+                    logger.error(f"Collector durdurma hatası: {e}")
+
             logger.info("🧹 Temizlik tamamlandı")
+
         except Exception as e:
             logger.error(f"Temizlik hatası: {str(e)}")
+
+    def get_system_status(self) -> Dict[str, Any]:
+        """Sistem durumunu getir"""
+        try:
+            return {
+                'running': self.running,
+                'uptime': self.get_uptime(),
+                'start_time': self.start_time,
+                'session_stats': self.session_stats.copy(),
+                'active_accounts': len(self.account_manager.active_accounts) if self.account_manager else 0,
+                'monitoring_groups': len(self.collector.monitoring_groups) if self.collector else 0
+            }
+        except Exception as e:
+            logger.error(f"System status hatası: {e}")
+            return {}
 
 # Signal handler for graceful shutdown
 def signal_handler(signum, frame):
@@ -337,6 +562,7 @@ async def main():
 
     try:
         # Sistemi başlat
+        logger.info("🚀 Sistem başlatma denemesi...")
         if not await app.initialize():
             logger.error("❌ Sistem başlatılamadı!")
             return
@@ -349,8 +575,13 @@ async def main():
         logger.info("⏹️ Program kullanıcı tarafından durduruldu")
     except Exception as e:
         logger.error(f"❌ Ana program hatası: {str(e)}")
+        import traceback
+        logger.error(f"Traceback: {traceback.format_exc()}")
     finally:
-        await app.cleanup()
+        try:
+            await app.cleanup()
+        except Exception as e:
+            logger.error(f"Cleanup hatası: {e}")
 
 if __name__ == "__main__":
     # Event loop'u çalıştır
