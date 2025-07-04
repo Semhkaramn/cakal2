@@ -8,7 +8,7 @@ import asyncio
 from datetime import datetime
 from typing import Optional, Dict, Union, Any
 from telethon import TelegramClient
-from telethon.errors import FloodWaitError, UserNotFoundError, RPCError
+from telethon.errors import FloodWaitError, RPCError
 import config
 
 logger = logging.getLogger(__name__)
